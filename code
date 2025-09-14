@@ -1,0 +1,816 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+SignatureBuilder v9 — Générateur de signatures e-mail (2M / MVP)
+- Fenêtre taille normale (1100x720), responsive, prévisualisation ≈ 40%
+- Carnet de profils (sauver/charger/supprimer) en %APPDATA%\SignatureBuilder\signatures.json
+- Champs identité, formule de politesse (éditable), langues fr/en/es/it/ar (+ RTL ar)
+- Contacts, site, adresse (<br> autorisé), email sur nouvelle ligne après l’adresse
+- Marques: 2M (générique) ou MVP (modèle EXACT donné par Samy)
+- Images: logo & photo via URL ou Import; PREVIEW télécharge en local (User-Agent)
+- SVG support: si cairosvg présent, conversion en PNG pour PREVIEW & Outlook
+- Liens rapides (4x texte+URL), réseaux sociaux, toggle logos certifications (2M)
+- Export: Copier HTML, Télécharger .htm, Envoi vers Outlook (%APPDATA%\Microsoft\Signatures)
+- Nommage fichiers basé sur le NOM DU PROFIL
+"""
+import os, re, sys, html, json, shutil, tempfile, webbrowser, urllib.request
+from pathlib import Path
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+
+# ---- Aperçu intégré --------------------------------------------------------------
+def _ensure_tkinterweb_on_sys_path():
+    try:
+        import tkinterweb  # noqa
+        return True
+    except Exception:
+        pass
+    appdata = os.getenv("APPDATA")
+    if appdata:
+        for ver in ("Python313", "Python313t", "Python312", "Python312t", "Python311", "Python311t"):
+            p = Path(appdata) / "Python" / ver / "site-packages"
+            if p.is_dir() and str(p) not in sys.path:
+                sys.path.append(str(p))
+    return False
+
+HTML_PREVIEW_AVAILABLE = True
+try:
+    from tkinterweb import HtmlFrame  # type: ignore
+except Exception:
+    _ensure_tkinterweb_on_sys_path()
+    try:
+        from tkinterweb import HtmlFrame  # type: ignore
+    except Exception:
+        HTML_PREVIEW_AVAILABLE = False
+
+# ---- Utils -----------------------------------------------------------------------
+APP_TITLE = "Générateur de Signatures E-mail Pro"
+SUBTITLE  = "2M-INDUSTRIES & Metro Valid Pharma (MVP)"
+
+def get_signatures_dir() -> Path:
+    appdata = os.getenv("APPDATA")
+    if appdata:
+        p = Path(appdata) / "Microsoft" / "Signatures"
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+    return Path.home() / "AppData" / "Roaming" / "Microsoft" / "Signatures"
+
+def get_appdata_store() -> Path:
+    appdata = os.getenv("APPDATA")
+    base = Path(appdata) if appdata else Path.home() / "AppData" / "Roaming"
+    store = base / "SignatureBuilder"
+    store.mkdir(parents=True, exist_ok=True)
+    return store
+
+def sanitize_filename(name: str) -> str:
+    name = re.sub(r"[\\/:\*\?\"<>\|]", " ", name)
+    name = re.sub(r"\s+", " ", name).strip()
+    return name or "signature"
+
+def escape_html(s: str) -> str:
+    return html.escape(s or "", quote=True)
+
+# ---- Profils ---------------------------------------------------------------------
+class ProfileStore:
+    def __init__(self):
+        self.path = get_appdata_store() / "signatures.json"
+        self.data = {"profiles": {}}
+        if self.path.exists():
+            try:
+                self.data = json.loads(self.path.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+
+    def list_names(self):
+        return sorted(self.data.get("profiles", {}).keys())
+
+    def get(self, name: str):
+        return self.data.get("profiles", {}).get(name)
+
+    def save(self, name: str, payload: dict):
+        if "profiles" not in self.data:
+            self.data["profiles"] = {}
+        self.data["profiles"][name] = payload
+        self._persist()
+
+    def delete(self, name: str):
+        self.data.get("profiles", {}).pop(name, None)
+        self._persist()
+
+    def _persist(self):
+        self.path.write_text(json.dumps(self.data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+# ---- Application -----------------------------------------------------------------
+class SignatureApp(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title(APP_TITLE + " — " + SUBTITLE)
+        self.geometry("1100x720")   # taille normale (pas plein écran)
+        self.minsize(900, 600)
+
+        # Thème
+        style = ttk.Style()
+        try:
+            style.theme_use("vista")
+        except Exception:
+            style.theme_use("clam")
+        style.configure("Card.TLabelframe", padding=10)
+        style.configure("Card.TLabelframe.Label", font=("Segoe UI", 9, "bold"))
+
+        # Données
+        self.pm = ProfileStore()
+        self.logo_local_path = None  # Path | None
+        self.photo_local_path = None
+
+        # Fonts sûres
+        self.font_choices = {
+            "Arial": "Arial, sans-serif",
+            "Calibri": "Calibri, Arial, sans-serif",
+            "Segoe UI": "Segoe UI, Tahoma, Geneva, Verdana, sans-serif",
+            "Tahoma": "Tahoma, Arial, sans-serif",
+            "Verdana": "Verdana, Arial, sans-serif",
+            "Trebuchet MS": "Trebuchet MS, Arial, sans-serif",
+            "Helvetica": "Helvetica, Arial, sans-serif",
+            "Times New Roman": "Times New Roman, Times, serif",
+            "Georgia": "Georgia, Times, serif",
+        }
+
+        # Traductions
+        self.language_var = tk.StringVar(value="fr")
+        self.translations = {
+            "fr": {"closing":"Cordialement,","mobile":"Mobile:","phone":"Tél :","fax":"Fax :","website":"Site web :","address":"Adresse :","email":"Email :","dir":"ltr"},
+            "en": {"closing":"Kind regards,","mobile":"Mobile:","phone":"Phone:","fax":"Fax:","website":"Website:","address":"Address:","email":"Email:","dir":"ltr"},
+            "es": {"closing":"Saludos cordiales,","mobile":"Móvil:","phone":"Tel.:","fax":"Fax:","website":"Sitio web:","address":"Dirección:","email":"Correo:","dir":"ltr"},
+            "it": {"closing":"Cordiali saluti,","mobile":"Cellulare:","phone":"Tel.:","fax":"Fax:","website":"Sito web:","address":"Indirizzo:","email":"Email:","dir":"ltr"},
+            "ar": {"closing":"مع أطيب التحيات،","mobile":"جوال:","phone":"هاتف:","fax":"فاكس:","website":"الموقع:","address":"العنوان:","email":"البريد الإلكتروني:","dir":"rtl"},
+        }
+
+        # Defaults marques
+        self.defaults = {
+            "2m": {
+                "fontFamily": "Arial, sans-serif",
+                "brandColor": "#1E3A91",
+                "logoUrl": "https://2m-industries.com/signature_mail/Logo_2M_trasnparent.png",
+                "website": "https://www.2m-industries.com",
+                "socials": {
+                    "youtube": "https://www.youtube.com/channel/UCWCe9unaTaFk9fpTqZxQ2DQ",
+                    "linkedin": "https://www.linkedin.com/company/2m-industries/mycompany/?viewAsMember=true",
+                    "facebook": "https://www.facebook.com/2mindustriesoff/",
+                    "instagram": "",
+                    "x": "",
+                },
+                "quickLinks": [
+                    ("Nos produits en vidéos !", "https://int.2m-industries.com/sig1"),
+                    ("Le catalogue 2M-INDUSTRIES", "https://int.2m-industries.com/sig2"),
+                    ("Besoin de SAV étalonnage ?", "https://int.2m-industries.com/sig3"),
+                    ("Pourquoi étalonner sa balance !", "https://int.2m-industries.com/sig4"),
+                ],
+                "tagline": '"Mesurer c\'est maîtriser !"',
+            },
+            "mvp": {
+                "fontFamily": "Tahoma, Arial, sans-serif",
+                "brandColor": "#4E6E50",
+                "logoUrl": "https://metrovalidpharma.com/commercial/Logo%20MVP.svg",
+                "website": "https://www.metrovalidpharma.com",
+                "socials": {"youtube": "", "linkedin": "", "facebook": "", "instagram": "", "x": ""},
+                "quickLinks": [("", ""), ("", ""), ("", ""), ("", "")],
+                "tagline": "",
+            },
+        }
+
+        # Variables
+        self.sig_width = tk.IntVar(value=600)
+        self.brand_var = tk.StringVar(value="2m")
+        self.font_var = tk.StringVar(value="Arial")
+        self.last_var = tk.StringVar(); self.first_var = tk.StringVar()
+        self.title_var = tk.StringVar(); self.tagline_var = tk.StringVar()
+        self.closing_var = tk.StringVar(value=self.translations["fr"]["closing"])
+        self.mobile_var = tk.StringVar(); self.phone_var = tk.StringVar()
+        self.fax_var = tk.StringVar(); self.email_var = tk.StringVar()
+        self.website_var = tk.StringVar(); self.address_var = tk.StringVar()
+        self.logo_var = tk.StringVar(); self.photo_var = tk.StringVar()
+        self.color_var = tk.StringVar()
+        self.youtube_var = tk.StringVar(); self.linkedin_var = tk.StringVar()
+        self.facebook_var = tk.StringVar(); self.instagram_var = tk.StringVar(); self.x_var = tk.StringVar()
+        self.ql_text = [tk.StringVar() for _ in range(4)]; self.ql_url = [tk.StringVar() for _ in range(4)]
+        self.cert_var = tk.BooleanVar(value=True)
+        self.profile_name_var = tk.StringVar(); self.profile_list_var = tk.StringVar()
+
+        # UI
+        self._build_ui()
+        self.load_brand_defaults("2m")
+        self.set_initial_user_values()
+        self.after(300, self._set_preview_ratio)
+        self.render_preview()
+
+    # ---- UI ------------------------------------------------------------------
+    def _build_ui(self):
+        # Header
+        header = tk.Frame(self, bg="#1E88E5"); header.pack(side="top", fill="x")
+        left = tk.Frame(header, bg="#1E88E5"); left.pack(side="left", padx=14, pady=10)
+        tk.Label(left, text="🎨  " + APP_TITLE, font=("Segoe UI Semibold", 12), fg="white", bg="#1E88E5").pack(anchor="w")
+        tk.Label(left, text=SUBTITLE, font=("Segoe UI", 9), fg="#E3F2FD", bg="#1E88E5").pack(anchor="w")
+        right = tk.Frame(header, bg="#1E88E5"); right.pack(side="right", padx=12, pady=10)
+        ttk.Button(right, text="👁  Aperçu Navigateur", command=self.preview_in_browser).pack(side="left", padx=(0,8))
+        ttk.Button(right, text="✏️  Générer & Enregistrer", command=self.generate_and_save).pack(side="left")
+
+        # Toolbar
+        toolbar = tk.Frame(self, bg="#ECEFF1"); toolbar.pack(side="top", fill="x")
+        tk.Label(toolbar, text="Largeur", bg="#ECEFF1").pack(side="left", padx=(12,4), pady=6)
+        sp = ttk.Spinbox(toolbar, from_=480, to=720, increment=20, textvariable=self.sig_width, width=6)
+        sp.pack(side="left"); ttk.Button(toolbar, text="Appliquer", command=self.render_preview).pack(side="left", padx=6)
+        ttk.Button(toolbar, text="Réinitialiser", command=lambda: self.sig_width.set(600) or self.render_preview()).pack(side="left")
+        ttk.Button(toolbar, text="📋 Copier HTML", command=self.copy_html).pack(side="right", padx=(0,10))
+        ttk.Button(toolbar, text="💾 Télécharger .htm", command=self.download_html).pack(side="right", padx=(0,10))
+        ttk.Button(toolbar, text="📨 Vers Outlook", command=self.send_to_outlook).pack(side="right", padx=(0,10))
+
+        # Split main
+        main = ttk.PanedWindow(self, orient="horizontal"); main.pack(fill="both", expand=True, padx=10, pady=10)
+
+        # Left tabs
+        left_wrap = ttk.Frame(main); main.add(left_wrap, weight=1)
+        left_wrap.rowconfigure(0, weight=1); left_wrap.columnconfigure(0, weight=1)
+        nb = ttk.Notebook(left_wrap); nb.grid(row=0, column=0, sticky="nsew")
+
+        # Profil tab
+        tab_profile = ttk.Frame(nb); nb.add(tab_profile, text="Profil")
+        card = ttk.Labelframe(tab_profile, text="Carnet de Profils", style="Card.TLabelframe"); card.pack(fill="x", padx=8, pady=8)
+        cont = ttk.Frame(card); cont.pack(fill="x")
+        for i in range(4): cont.columnconfigure(i, weight=1)
+        ttk.Label(cont, text="Nom du profil:").grid(row=0, column=0, sticky="w")
+        ttk.Entry(cont, textvariable=self.profile_name_var).grid(row=1, column=0, sticky="ew", padx=(0,6))
+        ttk.Label(cont, text="Profils existants:").grid(row=0, column=1, sticky="w")
+        self.profile_cb = ttk.Combobox(cont, textvariable=self.profile_list_var, values=self.pm.list_names(), state="readonly")
+        self.profile_cb.grid(row=1, column=1, sticky="ew", padx=(0,6))
+        ttk.Button(cont, text="Charger", command=self.load_selected_profile).grid(row=1, column=2, sticky="ew", padx=(0,6))
+        ttk.Button(cont, text="Supprimer", command=self.delete_selected_profile).grid(row=1, column=3, sticky="ew")
+
+        style_card = ttk.Labelframe(tab_profile, text="Modèle & Style", style="Card.TLabelframe"); style_card.pack(fill="x", padx=8, pady=(0,8))
+        sc = ttk.Frame(style_card); sc.pack(fill="x"); sc.columnconfigure(0, weight=1); sc.columnconfigure(1, weight=1); sc.columnconfigure(2, weight=1)
+        ttk.Label(sc, text="Modèle:").grid(row=0, column=0, sticky="w")
+        self.brand_cb = ttk.Combobox(sc, textvariable=self.brand_var, values=["2m", "mvp"], state="readonly")
+        self.brand_cb.grid(row=1, column=0, sticky="ew", padx=(0,6)); self.brand_cb.bind("<<ComboboxSelected>>", lambda e: self.load_brand_defaults(self.brand_var.get()))
+        ttk.Label(sc, text="Police:").grid(row=0, column=1, sticky="w")
+        self.font_cb = ttk.Combobox(sc, textvariable=self.font_var, values=list(self.font_choices.keys()), state="readonly")
+        self.font_cb.grid(row=1, column=1, sticky="ew", padx=(0,6))
+        ttk.Label(sc, text="Langue:").grid(row=0, column=2, sticky="w")
+        self.lang_cb = ttk.Combobox(sc, textvariable=self.language_var, values=["fr","en","es","it","ar"], state="readonly", width=6)
+        self.lang_cb.grid(row=1, column=2, sticky="w"); self.lang_cb.bind("<<ComboboxSelected>>", lambda e: self.on_language_change())
+
+        # Identité tab
+        tab_identity = ttk.Frame(nb); nb.add(tab_identity, text="Identité")
+        id_card = ttk.Labelframe(tab_identity, text="Identité", style="Card.TLabelframe"); id_card.pack(fill="x", padx=8, pady=8)
+        ic = ttk.Frame(id_card); ic.pack(fill="x"); ic.columnconfigure(0, weight=1); ic.columnconfigure(1, weight=1)
+        ttk.Label(ic, text="Prénom:").grid(row=0, column=0, sticky="w")
+        ttk.Entry(ic, textvariable=self.first_var).grid(row=1, column=0, sticky="ew", padx=(0,6))
+        ttk.Label(ic, text="Nom:").grid(row=0, column=1, sticky="w")
+        ttk.Entry(ic, textvariable=self.last_var).grid(row=1, column=1, sticky="ew")
+        ttk.Label(ic, text="Titre/Poste:").grid(row=2, column=0, sticky="w", pady=(8,0))
+        ttk.Entry(ic, textvariable=self.title_var).grid(row=3, column=0, sticky="ew", padx=(0,6))
+        ttk.Label(ic, text="Tagline:").grid(row=2, column=1, sticky="w", pady=(8,0))
+        ttk.Entry(ic, textvariable=self.tagline_var).grid(row=3, column=1, sticky="ew")
+        ttk.Label(ic, text="Formule de politesse:").grid(row=4, column=0, sticky="w", pady=(8,0))
+        ttk.Entry(ic, textvariable=self.closing_var).grid(row=5, column=0, columnspan=2, sticky="ew")
+
+        # Contact tab
+        tab_contact = ttk.Frame(nb); nb.add(tab_contact, text="Contact")
+        ph_card = ttk.Labelframe(tab_contact, text="Téléphones & e-mail", style="Card.TLabelframe"); ph_card.pack(fill="x", padx=8, pady=8)
+        ph = ttk.Frame(ph_card); ph.pack(fill="x"); ph.columnconfigure(0, weight=1); ph.columnconfigure(1, weight=1)
+        ttk.Label(ph, text="Mobile:").grid(row=0, column=0, sticky="w")
+        ttk.Entry(ph, textvariable=self.mobile_var).grid(row=1, column=0, sticky="ew", padx=(0,6))
+        ttk.Label(ph, text="Téléphone fixe:").grid(row=0, column=1, sticky="w")
+        ttk.Entry(ph, textvariable=self.phone_var).grid(row=1, column=1, sticky="ew")
+        ttk.Label(ph, text="Fax:").grid(row=2, column=0, sticky="w", pady=(8,0))
+        ttk.Entry(ph, textvariable=self.fax_var).grid(row=3, column=0, sticky="ew", padx=(0,6))
+        ttk.Label(ph, text="Email:").grid(row=2, column=1, sticky="w", pady=(8,0))
+        ttk.Entry(ph, textvariable=self.email_var).grid(row=3, column=1, sticky="ew")
+        web_card = ttk.Labelframe(tab_contact, text="Site & adresse", style="Card.TLabelframe"); web_card.pack(fill="x", padx=8, pady=(0,8))
+        wc = ttk.Frame(web_card); wc.pack(fill="x"); wc.columnconfigure(0, weight=1); wc.columnconfigure(1, weight=1)
+        ttk.Label(wc, text="URL site:").grid(row=0, column=0, sticky="w")
+        ttk.Entry(wc, textvariable=self.website_var).grid(row=1, column=0, sticky="ew", padx=(0,6))
+        ttk.Label(wc, text="Adresse (HTML <br> autorisé):").grid(row=0, column=1, sticky="w")
+        ttk.Entry(wc, textvariable=self.address_var).grid(row=1, column=1, sticky="ew")
+
+        # Marque tab
+        tab_brand = ttk.Frame(nb); nb.add(tab_brand, text="Marque")
+        br_card = ttk.Labelframe(tab_brand, text="Branding & images", style="Card.TLabelframe"); br_card.pack(fill="x", padx=8, pady=8)
+        bc = ttk.Frame(br_card); bc.pack(fill="x")
+        for i in range(4): bc.columnconfigure(i, weight=1)
+        ttk.Label(bc, text="Couleur principale (hex):").grid(row=0, column=0, sticky="w")
+        ttk.Entry(bc, textvariable=self.color_var).grid(row=1, column=0, sticky="ew", padx=(0,6))
+        ttk.Label(bc, text="URL du logo:").grid(row=0, column=1, sticky="w")
+        ttk.Entry(bc, textvariable=self.logo_var).grid(row=1, column=1, sticky="ew", padx=(0,6))
+        ttk.Button(bc, text="Importer logo…", command=self.import_logo).grid(row=1, column=2, sticky="ew", padx=(0,6))
+        ttk.Button(bc, text="Réinitialiser modèle", command=lambda: self.load_brand_defaults(self.brand_var.get())).grid(row=1, column=3, sticky="ew")
+        ttk.Label(bc, text="URL de la photo:").grid(row=2, column=0, sticky="w", pady=(8,0))
+        ttk.Entry(bc, textvariable=self.photo_var).grid(row=3, column=0, sticky="ew", padx=(0,6))
+        ttk.Button(bc, text="Importer photo…", command=self.import_photo).grid(row=3, column=1, sticky="ew")
+
+        # Liens tab
+        tab_links = ttk.Frame(nb); nb.add(tab_links, text="Liens")
+        soc_card = ttk.Labelframe(tab_links, text="Réseaux sociaux", style="Card.TLabelframe"); soc_card.pack(fill="x", padx=8, pady=8)
+        sc = ttk.Frame(soc_card); sc.pack(fill="x"); sc.columnconfigure(1, weight=1)
+        def row(r, label, var):
+            ttk.Label(sc, text=label).grid(row=r, column=0, sticky="w")
+            ttk.Entry(sc, textvariable=var).grid(row=r, column=1, sticky="ew")
+        row(0, "YouTube", self.youtube_var); row(1, "LinkedIn", self.linkedin_var)
+        row(2, "Facebook", self.facebook_var); row(3, "Instagram", self.instagram_var); row(4, "X / Twitter", self.x_var)
+        quick_card = ttk.Labelframe(tab_links, text="Liens rapides (4)", style="Card.TLabelframe"); quick_card.pack(fill="x", padx=8, pady=(0,8))
+        qc = ttk.Frame(quick_card); qc.pack(fill="x"); qc.columnconfigure(0, weight=1); qc.columnconfigure(1, weight=1)
+        for i in range(4):
+            ttk.Label(qc, text=f"Texte {i+1}").grid(row=i, column=0, sticky="w")
+            ttk.Entry(qc, textvariable=self.ql_text[i]).grid(row=i, column=1, sticky="ew", padx=(0,6))
+            ttk.Label(qc, text=f"URL {i+1}").grid(row=i, column=2, sticky="w")
+            ttk.Entry(qc, textvariable=self.ql_url[i]).grid(row=i, column=3, sticky="ew")
+        ck = ttk.Frame(tab_links); ck.pack(fill="x", padx=8, pady=(0,8))
+        ttk.Checkbutton(ck, text="Afficher les logos de certifications (2M)", variable=self.cert_var).pack(side="left")
+
+        # Right: preview + code
+        right = ttk.Frame(main); main.add(right, weight=2)
+        right.columnconfigure(0, weight=1); right.rowconfigure(0, weight=1)
+        self.preview_paned = ttk.PanedWindow(right, orient="vertical"); self.preview_paned.grid(row=0, column=0, sticky="nsew")
+        preview_frame = ttk.LabelFrame(self.preview_paned, text="Prévisualisation", padding=5)
+        self.preview_paned.add(preview_frame, weight=1)   # 40% via _set_preview_ratio()
+        code_frame = ttk.LabelFrame(self.preview_paned, text="Code HTML", padding=5)
+        self.preview_paned.add(code_frame, weight=2)
+
+        if HTML_PREVIEW_AVAILABLE:
+            self.preview = HtmlFrame(preview_frame, messages_enabled=False, horizontal_scrollbar="auto")
+            self.preview.pack(fill="both", expand=True)
+        else:
+            self.preview = None
+            ttk.Label(preview_frame, text="tkinterweb non détecté — utilisez « Aperçu Navigateur »\nou installez-le : python -m pip install --user tkinterweb tkinterweb-tkhtml").pack(fill="x")
+
+        code_frame.columnconfigure(0, weight=1); code_frame.rowconfigure(0, weight=1)
+        self.code_txt = tk.Text(code_frame, wrap="none", height=12, font=("Consolas", 10))
+        self.code_txt.grid(row=0, column=0, sticky="nsew")
+        yscroll = ttk.Scrollbar(code_frame, orient="vertical", command=self.code_txt.yview)
+        yscroll.grid(row=0, column=1, sticky="ns")
+        self.code_txt.configure(yscrollcommand=yscroll.set)
+
+    # ---- Helpers -----------------------------------------------------------------
+    def _set_preview_ratio(self):
+        try:
+            h = self.preview_paned.winfo_height()
+            self.preview_paned.sashplace(0, 0, int(h * 0.40))
+        except Exception:
+            pass
+
+    def on_language_change(self):
+        lang = self.language_var.get()
+        tr = self.translations.get(lang, self.translations["fr"])
+        current = (self.closing_var.get() or "").strip()
+        defaults = [v["closing"] for v in self.translations.values()]
+        if not current or current in defaults:
+            self.closing_var.set(tr["closing"])
+        self.render_preview()
+
+    def set_initial_user_values(self):
+        # Valeurs d'amorçage (modifiables)
+        self.last_var.set("MEDDAHI"); self.first_var.set("Samy")
+        self.title_var.set("Sales Manager & CMO")
+        self.tagline_var.set('"Mesurer c\'est maîtriser !"')
+        self.mobile_var.set("+213 (0) 555 05 01 65")
+        self.phone_var.set("+213 (0) 20 200 505 / 606 / 707")
+        self.fax_var.set("+213 (0) 20 200 101")
+        self.email_var.set("samy.meddahi@2m-industries.com")
+        self.website_var.set("https://www.2m-industries.com")
+        self.address_var.set("Résidence Gimmo, Immeuble N°03, <br>Bab Ezzouar, Alger – 16042 – Algérie.")
+        self.photo_var.set("https://2m-industries.com/signature_mail/photo_samy.jpeg")
+        self.profile_name_var.set(f"{self.first_var.get().strip()} {self.last_var.get().strip()} - {self.brand_var.get().upper()}")
+        self.profile_cb["values"] = self.pm.list_names()
+
+    def load_brand_defaults(self, key: str):
+        d = self.defaults.get(key, self.defaults["2m"])
+        selected_label = next((lbl for lbl, stack in self.font_choices.items() if stack == d["fontFamily"]), "Arial")
+        self.font_cb.set(selected_label)
+        self.color_var.set(d["brandColor"]); self.logo_var.set(d["logoUrl"]); self.website_var.set(d["website"])
+        s = d["socials"]
+        self.youtube_var.set(s.get("youtube","")); self.linkedin_var.set(s.get("linkedin",""))
+        self.facebook_var.set(s.get("facebook","")); self.instagram_var.set(s.get("instagram","")); self.x_var.set(s.get("x",""))
+        q = d["quickLinks"] + [("", "")] * (4 - len(d["quickLinks"]))
+        for i in range(4):
+            self.ql_text[i].set(q[i][0] or ""); self.ql_url[i].set(q[i][1] or "")
+        self.render_preview()
+
+    # ---- Images / SVG -------------------------------------------------------------
+    def _rasterize_svg_to_png(self, svg_bytes, out_path: Path):
+        """Convertit un SVG en PNG si cairosvg est dispo. Retourne le chemin PNG ou None."""
+        try:
+            import cairosvg  # type: ignore
+        except Exception:
+            return None
+        try:
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            cairosvg.svg2png(bytestring=svg_bytes, write_to=str(out_path))
+            return out_path
+        except Exception:
+            return None
+
+    def _map_images_for_mode(self, logo: str, photo: str, mode: str, sig_name: str):
+        """
+        - preview: télécharge en local + convertit SVG en PNG (si possible) pour l'aperçu
+        - outlook: place fichiers en %APPDATA%\Microsoft\Signatures\{sig}_files (+ conversion SVG)
+        """
+        import urllib.request
+        from urllib.parse import urlparse
+
+        UA = {"User-Agent": "Mozilla/5.0"}
+        def _download(url: str):
+            try:
+                req = urllib.request.Request(url, headers=UA)
+                with urllib.request.urlopen(req, timeout=10) as r:
+                    data = r.read()
+                ext = Path(urlparse(url).path).suffix.lower() or ".img"
+                return data, ext
+            except Exception:
+                return None, ""
+
+        if mode == "preview":
+            tmpdir = Path(tempfile.gettempdir()) / "signaturebuilder_preview"
+            tmpdir.mkdir(exist_ok=True)
+            # Logo
+            if logo and logo.lower().startswith("http"):
+                data, ext = _download(logo)
+                if data:
+                    if ext == ".svg":
+                        png = self._rasterize_svg_to_png(data, tmpdir / "logo.png")
+                        if png: logo = png.as_uri()
+                    else:
+                        lp = tmpdir / f"logo{ext}"; lp.write_bytes(data); logo = lp.as_uri()
+            elif self.logo_local_path:
+                logo = self.logo_local_path.as_uri()
+            # Photo
+            if photo and photo.lower().startswith("http"):
+                data, ext = _download(photo)
+                if data:
+                    if ext == ".svg":
+                        png = self._rasterize_svg_to_png(data, tmpdir / "photo.png")
+                        if png: photo = png.as_uri()
+                    else:
+                        lp = tmpdir / f"photo{ext}"; lp.write_bytes(data); photo = lp.as_uri()
+            elif self.photo_local_path:
+                photo = self.photo_local_path.as_uri()
+
+        elif mode == "outlook" and sig_name:
+            files_dir = getattr(self, "_outlook_files_dir", None)
+            files_dir_name = f"{sig_name}_files"
+            if isinstance(files_dir, Path):
+                files_dir.mkdir(parents=True, exist_ok=True)
+                # Logo
+                if self.logo_local_path:
+                    logo = f"{files_dir_name}/{self.logo_local_path.name}"
+                elif logo and logo.lower().startswith("http"):
+                    data, ext = _download(logo)
+                    if data:
+                        if ext == ".svg":
+                            png = self._rasterize_svg_to_png(data, files_dir / "logo.png")
+                            if png: logo = f"{files_dir_name}/logo.png"
+                        else:
+                            lp = files_dir / f"logo{ext}"; lp.write_bytes(data); logo = f"{files_dir_name}/{lp.name}"
+                # Photo
+                if self.photo_local_path:
+                    ext = Path(self.photo_local_path).suffix or ".png"
+                    photo = f"{files_dir_name}/photo{ext}"
+                elif photo and photo.lower().startswith("http"):
+                    data, ext = _download(photo)
+                    if data:
+                        if ext == ".svg":
+                            png = self._rasterize_svg_to_png(data, files_dir / "photo.png")
+                            if png: photo = f"{files_dir_name}/photo.png"
+                        else:
+                            lp = files_dir / f"photo{ext}"; lp.write_bytes(data); photo = f"{files_dir_name}/{lp.name}"
+        return logo, photo
+
+    # ---- Génération HTML -----------------------------------------------------------
+    def build_quick_links(self, font_family: str) -> str:
+        items = [(self.ql_text[i].get().strip(), self.ql_url[i].get().strip()) for i in range(4)]
+        items = [(t,u) for (t,u) in items if t and u]
+        if not items: return ""
+        html_links = " | ".join(
+            f'<a href="{escape_html(u)}" style="color:inherit;text-decoration:underline">{escape_html(t)}</a>' for (t,u) in items
+        )
+        return '<tr>\n  <td colspan="2" style="padding-top:10px;font-family:%s">%s</td>\n</tr>' % (escape_html(font_family), html_links)
+
+    def build_social_html(self) -> str:
+        icon_map = {
+            "youtube":  "https://2m-industries.com/signature_mail/yt.png",
+            "linkedin": "https://2m-industries.com/signature_mail/lk.png",
+            "facebook": "https://2m-industries.com/signature_mail/FB.png",
+            "instagram":"https://www.instagram.com/static/images/ico/favicon-200.png/ab6eff595bb1.png",
+            "x":        "https://abs.twimg.com/favicons/twitter.2.ico",
+        }
+        out = []
+        for (label, var) in (("youtube", self.youtube_var), ("linkedin", self.linkedin_var),
+                             ("facebook", self.facebook_var), ("instagram", self.instagram_var), ("x", self.x_var)):
+            url = var.get().strip()
+            if not url: continue
+            icon = icon_map.get(label)
+            out.append(
+                f'<a href="{escape_html(url)}">'
+                f'<img src="{icon}" alt="" width="20" height="20" '
+                f'style="margin-right:5px;display:inline-block;border:0;outline:none;text-decoration:none;"></a>'
+            )
+        return "".join(out)
+
+    def wrap_full_html(self, inner_html: str) -> str:
+        return '<!DOCTYPE html>\n<html><head><meta charset="utf-8"><title>Signature</title></head><body style="background:#fff;">%s</body></html>' % inner_html
+
+    def build_signature_html(self, mode: str = "normal", sig_name: str = "") -> str:
+        # Branche MVP (modèle exact fourni)
+        try:
+            brand_key = (self.brand_var.get() or "").strip().lower()
+        except Exception:
+            brand_key = "2m"
+
+        if brand_key == "mvp":
+            lang = self.language_var.get()
+            tr = self.translations.get(lang, self.translations.get("fr", {}))
+            dir_attr = tr.get("dir", "ltr")
+            width = int(self.sig_width.get() or 500)
+            color = "#4E6E50"
+            logo = (self.logo_var.get() or "https://metrovalidpharma.com/commercial/Logo%20MVP.svg").strip()
+            photo = self.photo_var.get().strip()
+            first = self.first_var.get().strip(); last = self.last_var.get().strip()
+            name_full = (first + " " + last).strip()
+            title = self.title_var.get().strip()
+            mobile = self.mobile_var.get().strip(); phone = self.phone_var.get().strip()
+            fax = self.fax_var.get().strip()
+            website = (self.website_var.get() or "https://www.metrovalidpharma.com").strip()
+            website_label = website.replace("https://","").replace("http://","") if website else ""
+            address = self.address_var.get().strip()
+            closing = (self.closing_var.get() or tr.get("closing","Cordialement,")).strip()
+
+            # Mapping images pour preview/outlook
+            logo, photo = self._map_images_for_mode(logo, photo, mode, sig_name)
+
+            photo_cell = f'<td style="vertical-align:top"><img src="{escape_html(photo)}" alt="Votre Photo" width="80" height="80" style="display: block; border-radius: 50%; max-width: 100%;"></td>' if photo else '<td style="vertical-align:top"></td>'
+
+            html_mvp = f"""
+<div dir="{dir_attr}">
+  <table cellpadding="0" cellspacing="0" style="max-width:{width}px; font-family:Tahoma">
+    <tbody>
+      <tr>
+        <td colspan="2" style="padding-bottom:10px">
+          {escape_html(closing)} <br>
+          <span style="font-weight:regular">{escape_html(name_full)}</span><br>
+        </td>
+      </tr>
+      <tr></tr>
+      <tr>
+        <td colspan="2" style="padding-bottom:10px">
+          <img src="{escape_html(logo)}" alt="Logo" width="400" height="80" style="display: block; max-width: 100%; height: auto;">
+        </td>
+      </tr>
+      <tr>
+        {photo_cell}
+        <td style="vertical-align:top;padding-left:10px">
+          <h2 style="font-weight:700;margin:0;color:{escape_html(color)}">{escape_html(name_full)}</h2>
+          {f'<h3 style="font-weight:700;margin:0;color:{escape_html(color)}">{escape_html(title)}</h3>' if title else ""}
+          {f'<span style="font-weight: bold;">Mobile:</span> {escape_html(mobile)}<br>' if mobile else ""}
+          {f'<span style="font-weight:700">Tél :</span> {escape_html(phone)} <br>' if phone else ""}
+          {f'<span style="font-weight:700">Fax :</span>{escape_html(fax)} <br>' if fax else ""}
+          {f'<span style="font-weight:700">Site web :</span><a href="{escape_html(website)}">{escape_html(website_label)}</a><br>' if website else ""}
+          {f'<span style="font-weight:700">Adresse :</span>{address} <br>' if address else ""}
+        </td>
+      </tr>
+    </tbody>
+  </table>
+</div>""".strip()
+            return html_mvp
+
+        # ----- Modèle générique (2M) -------------------------------------------
+        lang = self.language_var.get()
+        tr = self.translations.get(lang, self.translations["fr"])
+        dir_attr = tr.get("dir","ltr")
+        font_stack = self.font_choices.get(self.font_var.get(), self.font_choices["Arial"])
+        color = self.color_var.get().strip() or "#1E3A91"
+        logo = self.logo_var.get().strip(); photo = self.photo_var.get().strip()
+        first = self.first_var.get().strip(); last = self.last_var.get().strip()
+        name_full = (" ".join([first, last])).strip()
+        title = self.title_var.get().strip(); tagline = self.tagline_var.get().strip()
+        mobile = self.mobile_var.get().strip(); phone = self.phone_var.get().strip()
+        fax = self.fax_var.get().strip(); email = self.email_var.get().strip()
+        website = self.website_var.get().strip(); address = self.address_var.get().strip()
+        show_cert = self.cert_var.get(); width = int(self.sig_width.get() or 600)
+        closing = (self.closing_var.get() or tr["closing"]).strip()
+
+        # Map images
+        logo, photo = self._map_images_for_mode(logo, photo, mode, sig_name)
+
+        social_html = self.build_social_html()
+        quick_links_html = self.build_quick_links(font_stack)
+
+        certs = (
+            '<tr>\n  <td colspan="2" style="padding-top:10px">\n'
+            '    <a href="https://www.2m-industries.com/signature_mail/Certificat_2M-INDUSTRIES_ISO_9001_17020_37001.pdf">\n'
+            '      <img src="https://2m-industries.com/signature_mail/Logo_iso_9001_17020_37001.png" alt="Certifications" width="300" height="90" style="margin-right:20px; display:block; border:0; outline:none; text-decoration:none; max-width:100%; height:auto;">\n'
+            '    </a>\n  </td>\n</tr>'
+        ) if show_cert else ""
+
+        photo_cell = (
+            f'<td style="vertical-align:top">'
+            f'<img src="{escape_html(photo)}" alt="Photo" width="80" height="80" '
+            f'style="display:block;border-radius:50%;border:0;outline:none;text-decoration:none;"></td>'
+        ) if photo else '<td style="vertical-align:top"></td>'
+
+        website_label = (website or "").replace("https://", "").replace("http://", "")
+        base_text_style = f"max-width:{width}px; font-family:{escape_html(font_stack)}; font-size:13px; line-height:1.35; color:#222"
+
+        html_sig = f"""
+<div dir="{dir_attr}">
+  <table cellpadding="0" cellspacing="0" style="{base_text_style}">
+    <tbody>
+      <tr>
+        <td colspan="2" style="padding-bottom:10px">
+          {escape_html(closing)} <br>
+          <span style="font-weight:normal">{escape_html(name_full)}</span><br>
+          {f'<span style="font-style:italic">{escape_html(tagline)}</span>' if tagline else ""}
+        </td>
+      </tr>
+      <tr></tr>
+      <tr>
+        <td colspan="2" style="padding-bottom:10px">
+          <img src="{escape_html(logo)}" alt="Logo" width="400" height="80" style="display:block; max-width:100%; height:auto; border:0; outline:none; text-decoration:none;">
+        </td>
+      </tr>
+      <tr>
+        {photo_cell}
+        <td style="vertical-align:top;padding-left:10px">
+          <h2 style="font-weight:700;margin:0 0 2px 0;color:{escape_html(color)}; font-size:18px">{escape_html(name_full)}</h2>
+          {f'<h3 style="font-weight:700;margin:0 0 6px 0;color:{escape_html(color)}; font-size:14px">{escape_html(title)}</h3>' if title else ""}
+          {f'<span style="font-weight:bold">{escape_html(tr["mobile"])}</span> {escape_html(mobile)}<br>' if mobile else ""}
+          {f'<span style="font-weight:700">{escape_html(tr["phone"])}</span> {escape_html(phone)} <br>' if phone else ""}
+          {f'<span style="font-weight:700">{escape_html(tr["fax"])}</span> {escape_html(fax)} <br>' if fax else ""}
+          {f'<span style="font-weight:700">{escape_html(tr["website"])}</span><a href="{escape_html(website)}">{escape_html(website_label)}</a><br>' if website else ""}
+          {f'<span style="font-weight:700">{escape_html(tr["address"])}</span>{address}<br>' if address else ""}
+          {f'<span style="font-weight:700">{escape_html(tr["email"])}</span> <a href="mailto:{escape_html(email)}">{escape_html(email)}</a>' if email else ""}
+        </td>
+      </tr>
+      <tr><td colspan="2" style="padding-top:10px">{social_html}</td></tr>
+      {quick_links_html}
+      {certs}
+    </tbody>
+  </table>
+</div>""".strip()
+        return html_sig
+
+    # ---- Actions -----------------------------------------------------------------
+    def render_preview(self):
+        body = self.build_signature_html(mode="preview")
+        full = self.wrap_full_html(body)
+        if HTML_PREVIEW_AVAILABLE and getattr(self, "preview", None) is not None:
+            try:
+                self.preview.load_html(full)
+            except Exception:
+                pass
+        self.code_txt.delete("1.0", "end")
+        self.code_txt.insert("1.0", body)
+
+    def copy_html(self):
+        html_body = self.build_signature_html()
+        self.clipboard_clear(); self.clipboard_append(html_body)
+        messagebox.showinfo("Copie", "HTML copié dans le presse-papiers.")
+
+    def preview_in_browser(self):
+        full = self.wrap_full_html(self.build_signature_html())
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".htm") as tf:
+            tf.write(full.encode("utf-8"))
+            path = Path(tf.name)
+        webbrowser.open_new_tab(path.as_uri())
+
+    def download_html(self):
+        full = self.wrap_full_html(self.build_signature_html())
+        prof = (self.profile_name_var.get() or "").strip()
+        if not prof:
+            prof = f"{self.first_var.get().strip() or 'Prenom'} {self.last_var.get().strip() or 'Nom'}"
+        fname = sanitize_filename(prof) + ".htm"
+        dest = filedialog.asksaveasfilename(title="Enregistrer la signature", defaultextension=".htm",
+                                            filetypes=[("Fichier HTML", "*.htm;*.html")], initialfile=fname)
+        if not dest: return
+        Path(dest).write_text(full, encoding="utf-8")
+        webbrowser.open_new_tab(Path(dest).as_uri())
+        messagebox.showinfo("Enregistré", f"Signature enregistrée :\n{dest}")
+
+    def send_to_outlook(self):
+        # Nom basé sur le profil
+        prof = (self.profile_name_var.get() or "").strip()
+        if not prof:
+            prof = f"{self.first_var.get().strip() or 'Prenom'} {self.last_var.get().strip() or 'Nom'}"
+        sig_base = sanitize_filename(prof)
+
+        sig_dir = get_signatures_dir()
+        out_htm = sig_dir / f"{sig_base}.htm"
+        files_dir = sig_dir / f"{sig_base}_files"
+        files_dir.mkdir(parents=True, exist_ok=True)
+
+        # Indiquer à _map_images_for_mode où écrire
+        self._outlook_files_dir = files_dir
+        html_body = self.build_signature_html(mode="outlook", sig_name=sig_base)
+        try:
+            del self._outlook_files_dir
+        except Exception:
+            pass
+
+        full = self.wrap_full_html(html_body)
+
+        # Copier les imports locaux (logo/photo)
+        if self.logo_local_path and Path(self.logo_local_path).exists():
+            shutil.copy2(self.logo_local_path, files_dir / Path(self.logo_local_path).name)
+        if self.photo_local_path and Path(self.photo_local_path).exists():
+            ext = Path(self.photo_local_path).suffix or ".png"
+            shutil.copy2(self.photo_local_path, files_dir / f"photo{ext}")
+
+        out_htm.write_text(full, encoding="utf-8")
+        messagebox.showinfo("OK", f"Signature installée pour Outlook :\n{out_htm}\nActive-la dans Outlook (Options > Courrier > Signatures).")
+        try:
+            os.startfile(str(sig_dir))
+        except Exception:
+            pass
+
+    def generate_and_save(self):
+        self.render_preview()
+        name = self.profile_name_var.get().strip() or f"{self.first_var.get().strip()} {self.last_var.get().strip()} - {self.brand_var.get().upper()}"
+        self.profile_name_var.set(name)
+        self.pm.save(name, self.current_payload())
+        self.profile_cb["values"] = self.pm.list_names()
+
+    def current_payload(self) -> dict:
+        return {
+            "brand": self.brand_var.get(),
+            "font": self.font_choices.get(self.font_var.get(), self.font_choices["Arial"]),
+            "fontLabel": self.font_var.get(),
+            "last": self.last_var.get(), "first": self.first_var.get(),
+            "title": self.title_var.get(), "tagline": self.tagline_var.get(),
+            "closing": self.closing_var.get(), "lang": self.language_var.get(),
+            "mobile": self.mobile_var.get(), "phone": self.phone_var.get(),
+            "fax": self.fax_var.get(), "email": self.email_var.get(),
+            "website": self.website_var.get(), "address": self.address_var.get(),
+            "logo": self.logo_var.get(), "photo": self.photo_var.get(),
+            "color": self.color_var.get(),
+            "socials": {"youtube": self.youtube_var.get(), "linkedin": self.linkedin_var.get(),
+                        "facebook": self.facebook_var.get(), "instagram": self.instagram_var.get(), "x": self.x_var.get()},
+            "quick": [(self.ql_text[i].get(), self.ql_url[i].get()) for i in range(4)],
+            "cert": bool(self.cert_var.get()),
+            "sig_width": int(self.sig_width.get() or 600),
+        }
+
+    def load_selected_profile(self):
+        name = self.profile_list_var.get().strip()
+        if not name:
+            messagebox.showinfo("Carnet", "Choisissez un profil existant."); return
+        p = self.pm.get(name)
+        if not p:
+            messagebox.showerror("Carnet", "Profil introuvable."); return
+        self.apply_payload(p); self.profile_name_var.set(name); self.render_preview()
+
+    def delete_selected_profile(self):
+        name = self.profile_list_var.get().strip()
+        if not name: return
+        if messagebox.askyesno("Confirmer", f"Supprimer le profil « {name} » ?"):
+            self.pm.delete(name)
+            self.profile_cb["values"] = self.pm.list_names()
+            if self.profile_name_var.get().strip() == name:
+                self.profile_name_var.set("")
+
+    def apply_payload(self, p: dict):
+        self.brand_var.set(p.get("brand","2m"))
+        fl = p.get("fontLabel")
+        if fl and fl in self.font_choices: self.font_cb.set(fl)
+        self.last_var.set(p.get("last","")); self.first_var.set(p.get("first",""))
+        self.title_var.set(p.get("title","")); self.tagline_var.set(p.get("tagline",""))
+        self.closing_var.set(p.get("closing", self.translations.get(p.get("lang","fr"), self.translations["fr"])["closing"]))
+        self.language_var.set(p.get("lang","fr"))
+        self.mobile_var.set(p.get("mobile","")); self.phone_var.set(p.get("phone",""))
+        self.fax_var.set(p.get("fax","")); self.email_var.set(p.get("email",""))
+        self.website_var.set(p.get("website","")); self.address_var.set(p.get("address",""))
+        self.logo_var.set(p.get("logo","")); self.photo_var.set(p.get("photo",""))
+        self.color_var.set(p.get("color","#1E3A91"))
+        s = p.get("socials",{})
+        self.youtube_var.set(s.get("youtube","")); self.linkedin_var.set(s.get("linkedin",""))
+        self.facebook_var.set(s.get("facebook","")); self.instagram_var.set(s.get("instagram","")); self.x_var.set(s.get("x",""))
+        q = p.get("quick",[("", "")]*4)
+        for i in range(4):
+            t,u = q[i] if i < len(q) else ("","")
+            self.ql_text[i].set(t); self.ql_url[i].set(u)
+        self.cert_var.set(bool(p.get("cert", True)))
+        if "sig_width" in p: self.sig_width.set(int(p.get("sig_width", 600)))
+
+    # ---- Imports -----------------------------------------------------------------
+    def import_logo(self):
+        p = filedialog.askopenfilename(title="Choisir un logo", filetypes=[("Images", "*.png;*.jpg;*.jpeg;*.gif;*.svg;*.webp"), ("Tous les fichiers", "*.*")])
+        if p:
+            self.logo_local_path = Path(p); self.logo_var.set(self.logo_local_path.name + " (local)"); self.render_preview()
+
+    def import_photo(self):
+        p = filedialog.askopenfilename(title="Choisir une photo", filetypes=[("Images", "*.png;*.jpg;*.jpeg;*.gif;*.svg;*.webp"), ("Tous les fichiers", "*.*")])
+        if p:
+            self.photo_local_path = Path(p); self.photo_var.set(self.photo_local_path.name + " (local)"); self.render_preview()
+
+# ---- Main ------------------------------------------------------------------------
+def main():
+    app = SignatureApp()
+    app.mainloop()
+
+if __name__ == "__main__":
+    main()
