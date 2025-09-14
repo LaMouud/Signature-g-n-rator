@@ -13,10 +13,16 @@ SignatureBuilder v9 — Générateur de signatures e-mail (2M / MVP)
 - Export: Copier HTML, Télécharger .htm, Envoi vers Outlook (%APPDATA%\Microsoft\Signatures)
 - Nommage fichiers basé sur le NOM DU PROFIL
 """
-import os, re, sys, html, json, shutil, tempfile, webbrowser, urllib.request
+import os, re, sys, html, json, shutil, tempfile, webbrowser, urllib.request, io
 from pathlib import Path
+from urllib.parse import urlparse
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
+try:
+    from PIL import Image, ImageTk  # type: ignore
+    PIL_AVAILABLE = True
+except Exception:
+    PIL_AVAILABLE = False
 
 # ---- Aperçu intégré --------------------------------------------------------------
 def _ensure_tkinterweb_on_sys_path():
@@ -46,6 +52,11 @@ except Exception:
 # ---- Utils -----------------------------------------------------------------------
 APP_TITLE = "Générateur de Signatures E-mail Pro"
 SUBTITLE  = "2M-INDUSTRIES & Metro Valid Pharma (MVP)"
+
+DEFAULT_PHOTO_URLS = {
+    "2m": "https://www.metrovalidpharma.com/sign/photo_prod.gif",
+    "mvp": "",
+}
 
 def get_signatures_dir() -> Path:
     appdata = os.getenv("APPDATA")
@@ -195,9 +206,11 @@ class SignatureApp(tk.Tk):
         self.ql_text = [tk.StringVar() for _ in range(4)]; self.ql_url = [tk.StringVar() for _ in range(4)]
         self.cert_var = tk.BooleanVar(value=True)
         self.profile_name_var = tk.StringVar(); self.profile_list_var = tk.StringVar()
+        self._photo_preview_img = None
 
         # UI
         self._build_ui()
+        self.photo_var.trace_add("write", lambda *_: self.update_photo_preview())
         self.load_brand_defaults("2m")
         self.set_initial_user_values()
         self.after(300, self._set_preview_ratio)
@@ -305,6 +318,9 @@ class SignatureApp(tk.Tk):
         ttk.Label(bc, text="URL de la photo:").grid(row=2, column=0, sticky="w", pady=(8,0))
         ttk.Entry(bc, textvariable=self.photo_var).grid(row=3, column=0, sticky="ew", padx=(0,6))
         ttk.Button(bc, text="Importer photo…", command=self.import_photo).grid(row=3, column=1, sticky="ew")
+        ttk.Button(bc, text="Photo par défaut", command=self.set_default_photo).grid(row=4, column=0, sticky="w", pady=(4,0))
+        self.photo_preview_lbl = ttk.Label(bc)
+        self.photo_preview_lbl.grid(row=4, column=1, columnspan=3, sticky="w", pady=(4,0))
 
         # Liens tab
         tab_links = ttk.Frame(nb); nb.add(tab_links, text="Liens")
@@ -376,7 +392,7 @@ class SignatureApp(tk.Tk):
         self.email_var.set("samy.meddahi@2m-industries.com")
         self.website_var.set("https://www.2m-industries.com")
         self.address_var.set("Résidence Gimmo, Immeuble N°03, <br>Bab Ezzouar, Alger – 16042 – Algérie.")
-        self.photo_var.set("https://2m-industries.com/signature_mail/photo_samy.jpeg")
+        self.photo_var.set(DEFAULT_PHOTO_URLS["2m"])
         self.profile_name_var.set(f"{self.first_var.get().strip()} {self.last_var.get().strip()} - {self.brand_var.get().upper()}")
         self.profile_cb["values"] = self.pm.list_names()
 
@@ -385,6 +401,8 @@ class SignatureApp(tk.Tk):
         selected_label = next((lbl for lbl, stack in self.font_choices.items() if stack == d["fontFamily"]), "Arial")
         self.font_cb.set(selected_label)
         self.color_var.set(d["brandColor"]); self.logo_var.set(d["logoUrl"]); self.website_var.set(d["website"])
+        self.photo_local_path = None
+        self.photo_var.set(DEFAULT_PHOTO_URLS.get(key, ""))
         s = d["socials"]
         self.youtube_var.set(s.get("youtube","")); self.linkedin_var.set(s.get("linkedin",""))
         self.facebook_var.set(s.get("facebook","")); self.instagram_var.set(s.get("instagram","")); self.x_var.set(s.get("x",""))
@@ -805,7 +823,53 @@ class SignatureApp(tk.Tk):
     def import_photo(self):
         p = filedialog.askopenfilename(title="Choisir une photo", filetypes=[("Images", "*.png;*.jpg;*.jpeg;*.gif;*.svg;*.webp"), ("Tous les fichiers", "*.*")])
         if p:
-            self.photo_local_path = Path(p); self.photo_var.set(self.photo_local_path.name + " (local)"); self.render_preview()
+            self.photo_local_path = Path(p); self.photo_var.set(self.photo_local_path.name + " (local)"); self.render_preview(); self.update_photo_preview()
+
+    def set_default_photo(self):
+        url = DEFAULT_PHOTO_URLS.get(self.brand_var.get(), "")
+        self.photo_local_path = None
+        self.photo_var.set(url)
+        self.render_preview()
+
+    def update_photo_preview(self):
+        if not PIL_AVAILABLE:
+            return
+        img = None
+        url = self.photo_var.get().strip()
+        if self.photo_local_path and self.photo_local_path.exists():
+            try:
+                img = Image.open(self.photo_local_path)
+            except Exception:
+                img = None
+        elif url.lower().startswith("http"):
+            try:
+                req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                with urllib.request.urlopen(req, timeout=10) as r:
+                    data = r.read()
+                ext = Path(urlparse(url).path).suffix.lower()
+                if ext == ".svg":
+                    tmp = Path(tempfile.gettempdir()) / "photo_preview.png"
+                    png = self._rasterize_svg_to_png(data, tmp)
+                    if png:
+                        img = Image.open(png)
+                else:
+                    img = Image.open(io.BytesIO(data))
+            except Exception:
+                img = None
+        elif url and Path(url).exists():
+            try:
+                img = Image.open(url)
+            except Exception:
+                img = None
+        if img:
+            try:
+                img.thumbnail((80, 80))
+                self._photo_preview_img = ImageTk.PhotoImage(img)
+                self.photo_preview_lbl.config(image=self._photo_preview_img)
+            except Exception:
+                self.photo_preview_lbl.config(image="")
+        else:
+            self.photo_preview_lbl.config(image="")
 
 # ---- Main ------------------------------------------------------------------------
 def main():
